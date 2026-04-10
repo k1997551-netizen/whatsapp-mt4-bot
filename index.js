@@ -1,166 +1,283 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require("@whiskeysockets/baileys");
-const pino    = require("pino");
-const fs      = require("fs-extra");
-const axios   = require("axios");
-const express = require("express");
-const QRCode  = require("qrcode");
 
-const TRUSTED_SENDER = process.env.TRUSTED_SENDER || "";
-const LOT_SIZE       = parseFloat(process.env.LOT_SIZE || "0.01");
-const META_TOKEN     = process.env.META_TOKEN || "";
-const META_ACCOUNT   = process.env.META_ACCOUNT_ID || "";
-const MAX_TRADES     = parseInt(process.env.MAX_TRADES_PER_DAY || "5");
-const PORT           = process.env.PORT || 3000;
+// =============================================
+//   البوت الرئيسي - واتساب + MetaAPI + MT4
+//   بشار يرسل ← البوت يقرأ ← MetaAPI ينفذ
+// =============================================
 
-let currentQR = null;
-let isConnected = false;
-let dailyTrades = 0;
-let lastDate = new Date().toDateString();
-let botStatus = "starting";
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
+const MetaApi = require('metaapi.cloud-sdk').default;
+const express = require('express');
+const qrcode  = require('qrcode');
+const fs      = require('fs');
+const path    = require('path');
+const SignalParser = require('./signalParser');
 
-fs.ensureDirSync("./auth");
-const parser = require("./signalParser");
-const p = new parser();
+// ── متغيرات البيئة ───────────────────────────
+const TRUSTED_SENDER    = process.env.TRUSTED_SENDER    || '';
+const LOT_SIZE          = parseFloat(process.env.LOT_SIZE || '0.01');
+const MAX_TRADES_PER_DAY= parseInt(process.env.MAX_TRADES_PER_DAY || '10');
+const META_TOKEN        = process.env.META_TOKEN        || '';
+const META_ACCOUNT_ID   = process.env.META_ACCOUNT_ID   || '';
+const PORT              = process.env.PORT              || 3000;
 
-// ── Express Server ─────────────────────────
-const app = express();
+// ── مرتبطات ──────────────────────────────────
+const parser     = new SignalParser();
+let   currentQR  = null;
+let   dailyTrades= 0;
+let   lastDate   = new Date().toDateString();
+let   metaAccount= null;
 
-// Keep-alive ping (prevents Railway from sleeping)
-setInterval(() => {
-  axios.get(`http://localhost:${PORT}/ping`).catch(() => {});
-}, 25000);
+// ── تسجيل ────────────────────────────────────
+function log(msg) {
+  const ts = new Date().toISOString();
+  console.log(`[${ts}] ${msg}`);
+}
 
-app.get("/ping", (req, res) => res.send("ok"));
+// ── تصفير الصفقات اليومية ────────────────────
+function checkReset() {
+  const today = new Date().toDateString();
+  if (today !== lastDate) { dailyTrades = 0; lastDate = today; }
+}
 
-app.get("/", async (req, res) => {
-  if (isConnected) {
-    return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8">
-      <style>body{background:#0d1117;color:#00ff88;font-family:Arial;text-align:center;padding:60px}</style>
-      </head><body>
-      <h1>✅ البوت متصل بواتساب!</h1>
-      <h3>يراقب توصيات بشار المجرفي تلقائياً 🤖</h3>
-      <p style="color:#ccc">رقم المراقَب: ${TRUSTED_SENDER}</p>
-      </body></html>`);
-  }
-  if (!currentQR) {
-    return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8">
-      <meta http-equiv="refresh" content="5">
-      <style>body{background:#0d1117;color:#fff;font-family:Arial;text-align:center;padding:60px}</style>
-      </head><body>
-      <h2>⏳ جاري تشغيل البوت...</h2>
-      <p>الحالة: ${botStatus}</p>
-      <p style="color:#888">تحديث تلقائي كل 5 ثوانٍ</p>
-      </body></html>`);
+// ── الاتصال بـ MetaAPI ────────────────────────
+async function connectMetaAPI() {
+  if (!META_TOKEN || !META_ACCOUNT_ID) {
+    log('⚠️ META_TOKEN أو META_ACCOUNT_ID غير موجود - لن يتم تنفيذ الصفقات');
+    return null;
   }
   try {
-    const img = await QRCode.toDataURL(currentQR, { width: 350, margin: 2, color: { dark: "#000", light: "#fff" } });
-    return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8">
-      <meta http-equiv="refresh" content="25">
-      <style>body{background:#0d1117;color:#fff;font-family:Arial;text-align:center;padding:30px}
-      img{border:8px solid #00ff88;border-radius:12px}
-      h2{color:#00ff88}</style>
-      </head><body>
-      <h2>📱 امسح الكود بواتساب</h2>
-      <img src="${img}"/><br><br>
-      <p>واتساب ← ⋮ ← الأجهزة المرتبطة ← ربط جهاز</p>
-      <p style="color:#888;font-size:13px">ينتهي الكود بعد 60 ثانية - يتجدد تلقائياً</p>
-      </body></html>`);
-  } catch(e) {
-    return res.send("Error: " + e.message);
-  }
-});
+    const api     = new MetaApi(META_TOKEN);
+    const account = await api.metatraderAccountApi.getAccount(META_ACCOUNT_ID);
 
-app.listen(PORT, () => console.log("🌐 Server on port " + PORT));
+    if (!['DEPLOYING','DEPLOYED'].includes(account.state)) {
+      log('🔄 جاري نشر الحساب...');
+      await account.deploy();
+    }
+    log('⏳ انتظار اتصال MT4...');
+    await account.waitConnected();
 
-// ── WhatsApp Bot ───────────────────────────
-async function startBot() {
-  botStatus = "connecting to WhatsApp...";
-  console.log("🚀 Starting bot...");
+    const connection = account.getRPCConnection();
+    await connection.connect();
+    await connection.waitSynchronized();
 
-  try {
-    const { version } = await fetchLatestBaileysVersion();
-    const { state, saveCreds } = await useMultiFileAuthState("./auth");
-
-    const sock = makeWASocket({
-      version,
-      auth: state,
-      printQRInTerminal: false,
-      logger: pino({ level: "silent" }),
-      browser: ["WhatsApp-MT4-Bot", "Chrome", "1.0"],
-      connectTimeoutMs: 60000,
-      defaultQueryTimeoutMs: 60000,
-    });
-
-    sock.ev.on("creds.update", saveCreds);
-
-    sock.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
-      if (qr) {
-        currentQR = qr;
-        botStatus = "QR ready - scan now!";
-        console.log("📱 QR Code generated!");
-      }
-      if (connection === "open") {
-        isConnected = true;
-        currentQR = null;
-        botStatus = "connected";
-        console.log("🟢 WhatsApp Connected!");
-      }
-      if (connection === "close") {
-        isConnected = false;
-        currentQR = null;
-        botStatus = "reconnecting...";
-        const code = lastDisconnect?.error?.output?.statusCode;
-        console.log("🔄 Reconnecting... code:", code);
-        if (code !== DisconnectReason.loggedOut) {
-          setTimeout(startBot, 5000);
-        } else {
-          console.log("❌ Logged out");
-          fs.removeSync("./auth");
-          setTimeout(startBot, 3000);
-        }
-      }
-    });
-
-    sock.ev.on("messages.upsert", async ({ messages }) => {
-      for (const msg of messages) {
-        if (!msg.message || msg.key.fromMe) continue;
-        const from = msg.key.remoteJid || "";
-        const text = msg.message?.conversation ||
-                     msg.message?.extendedTextMessage?.text || "";
-        if (!text || !TRUSTED_SENDER) continue;
-        if (!from.includes(TRUSTED_SENDER)) continue;
-
-        console.log("📩 Signal from trusted sender:", text.substring(0, 60));
-        const signal = p.parse(text);
-        if (!signal || signal.action !== "OPEN") continue;
-
-        const today = new Date().toDateString();
-        if (today !== lastDate) { dailyTrades = 0; lastDate = today; }
-        if (dailyTrades >= MAX_TRADES) { console.log("⛔ Daily limit"); continue; }
-
-        console.log("🔍 Signal:", p.format(signal));
-
-        if (META_TOKEN && META_ACCOUNT) {
-          try {
-            await axios.post(
-              "https://mt-client-api-v1.london.agiliumtrade.ai/users/current/accounts/" + META_ACCOUNT + "/trade",
-              { actionType: signal.direction.includes("BUY") ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL",
-                symbol: signal.symbol, volume: LOT_SIZE,
-                stopLoss: signal.sl || 0, takeProfit: signal.tp1 || 0 },
-              { headers: { "auth-token": META_TOKEN } }
-            );
-            console.log("✅ Trade executed:", signal.direction, signal.symbol);
-          } catch(e) { console.log("❌ Trade error:", e.message); }
-        }
-        dailyTrades++;
-      }
-    });
-
-  } catch(e) {
-    botStatus = "error - restarting...";
-    console.log("❌ Bot error:", e.message);
-    setTimeout(startBot, 5000);
+    log('✅ MetaAPI متصل بـ MT4!');
+    return connection;
+  } catch (err) {
+    log('❌ خطأ MetaAPI: ' + err.message);
+    return null;
   }
 }
 
-startBot();
+// ── تنفيذ الصفقة ──────────────────────────────
+async function executeTrade(signal) {
+  if (!metaAccount) {
+    log('⚠️ MetaAPI غير متصل - تخطي الصفقة');
+    return false;
+  }
+  try {
+    const type = signal.direction === 'BUY' ? 'ORDER_TYPE_BUY' : 'ORDER_TYPE_SELL';
+    const tradeOptions = {
+      actionType: type,
+      symbol:     signal.symbol,
+      volume:     LOT_SIZE,
+    };
+    if (signal.sl)  tradeOptions.stopLoss   = signal.sl;
+    if (signal.tp1) tradeOptions.takeProfit = signal.tp1;
+
+    log(`📤 إرسال أمر: ${signal.symbol} ${signal.direction} @ LOT=${LOT_SIZE}`);
+    const result = await metaAccount.createMarketBuyOrder
+      ? await metaAccount.createMarketBuyOrder(signal.symbol, LOT_SIZE, signal.sl, signal.tp1)
+      : await metaAccount.trade(tradeOptions);
+
+    log(`✅ صفقة منفذة: ${JSON.stringify(result)}`);
+    return true;
+  } catch (err) {
+    log('❌ خطأ في تنفيذ الصفقة: ' + err.message);
+    return false;
+  }
+}
+
+// ── تنفيذ الصفقة عبر REST مباشر ──────────────
+async function executeTradeREST(signal) {
+  if (!META_TOKEN || !META_ACCOUNT_ID) return false;
+  try {
+    const https  = require('https');
+    const type   = signal.direction === 'BUY' ? 'ORDER_TYPE_BUY' : 'ORDER_TYPE_SELL';
+    const body   = JSON.stringify({
+      actionType: type,
+      symbol:     signal.symbol,
+      volume:     LOT_SIZE,
+      stopLoss:   signal.sl   || undefined,
+      takeProfit: signal.tp1  || undefined,
+    });
+
+    return new Promise((resolve) => {
+      const options = {
+        hostname: 'mt-client-api-v1.new-york.agiliumtrade.ai',
+        path:     `/users/current/accounts/${META_ACCOUNT_ID}/trade`,
+        method:   'POST',
+        headers:  {
+          'Content-Type':  'application/json',
+          'auth-token':    META_TOKEN,
+          'Content-Length': Buffer.byteLength(body),
+        },
+      };
+      const req = https.request(options, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+          log(`✅ REST صفقة: ${res.statusCode} - ${data.substring(0,100)}`);
+          resolve(res.statusCode < 300);
+        });
+      });
+      req.on('error', (e) => { log('❌ REST خطأ: ' + e.message); resolve(false); });
+      req.write(body);
+      req.end();
+    });
+  } catch (err) {
+    log('❌ executeTradeREST: ' + err.message);
+    return false;
+  }
+}
+
+// ── Express للـ QR ────────────────────────────
+const app = express();
+app.get('/', async (req, res) => {
+  if (currentQR) {
+    const img = await qrcode.toDataURL(currentQR);
+    res.send(`<!DOCTYPE html>
+<html dir="rtl">
+<head><meta charset="UTF-8"><title>WhatsApp QR</title>
+<meta http-equiv="refresh" content="15">
+<style>body{font-family:Arial;text-align:center;padding:30px;background:#f0f2f5}
+h2{color:#128c7e}img{border:3px solid #128c7e;border-radius:12px;padding:10px;background:#fff}</style>
+</head><body>
+<h2>🤖 امسح كود QR بواتساب</h2>
+<p>واتساب ← ⋮ ← الأجهزة المرتبطة ← ربط جهاز</p>
+<img src="${img}" width="260"/><br>
+<small>تحديث تلقائي كل 15 ثانية</small>
+</body></html>`);
+  } else {
+    res.send(`<!DOCTYPE html>
+<html dir="rtl">
+<head><meta charset="UTF-8"><title>Bot Status</title>
+<meta http-equiv="refresh" content="10">
+<style>body{font-family:Arial;text-align:center;padding:40px;background:#f0f2f5}
+.ok{color:#128c7e;font-size:48px}.info{color:#555;margin-top:20px}</style>
+</head><body>
+<div class="ok">✅</div>
+<h2>البوت متصل ويعمل</h2>
+<div class="info">
+  <p>📱 واتساب: متصل</p>
+  <p>📊 MetaAPI: ${META_TOKEN ? 'مفعّل' : 'غير مفعّل'}</p>
+  <p>🎯 المرسل الموثوق: ${TRUSTED_SENDER || 'الكل'}</p>
+  <p>💼 حجم اللوت: ${LOT_SIZE}</p>
+</div>
+</body></html>`);
+  }
+});
+app.listen(PORT, () => log(`🌐 Server on port ${PORT}`));
+
+// ── واتساب ────────────────────────────────────
+async function startWhatsApp() {
+  const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+
+  const sock = makeWASocket({
+    auth:           state,
+    printQRInTerminal: true,
+    browser:        ['WhatsApp MT4 Bot', 'Chrome', '1.0'],
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
+    if (qr) {
+      currentQR = qr;
+      log('📱 QR جاهز - افتح: ' + (process.env.RAILWAY_STATIC_URL || `http://localhost:${PORT}`));
+    }
+    if (connection === 'open') {
+      currentQR = null;
+      log('✅ واتساب متصل!');
+      // اتصل بـ MetaAPI بعد اتصال واتساب
+      if (!metaAccount) {
+        metaAccount = await connectMetaAPI();
+      }
+    }
+    if (connection === 'close') {
+      const code = lastDisconnect?.error instanceof Boom
+        ? lastDisconnect.error.output.statusCode : null;
+      if (code !== DisconnectReason.loggedOut) {
+        log('🔄 إعادة الاتصال...');
+        setTimeout(startWhatsApp, 5000);
+      } else {
+        log('🚪 تم تسجيل الخروج - امسح QR مرة أخرى');
+        setTimeout(startWhatsApp, 3000);
+      }
+    }
+  });
+
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+
+    for (const msg of messages) {
+      try {
+        if (msg.key.fromMe) continue;
+        const body = msg.message?.conversation
+          || msg.message?.extendedTextMessage?.text
+          || '';
+        if (!body.trim()) continue;
+
+        // فحص المرسل
+        const sender = msg.key.participant || msg.key.remoteJid || '';
+        const senderNumber = sender.replace(/[^0-9]/g, '');
+
+        // إذا في TRUSTED_SENDER افحصه
+        if (TRUSTED_SENDER) {
+          const trustedNum = TRUSTED_SENDER.replace(/[^0-9]/g, '');
+          if (!senderNumber.includes(trustedNum) && !trustedNum.includes(senderNumber)) {
+            continue; // تجاهل
+          }
+        }
+
+        log(`📩 رسالة من ${senderNumber}: ${body.substring(0, 100)}`);
+
+        const signal = parser.parse(body);
+        if (!signal) {
+          log('ℹ️ ليست توصية - تم تجاهلها');
+          continue;
+        }
+
+        log(`🔍 توصية: ${JSON.stringify(signal)}`);
+        console.log('\n' + '─'.repeat(50));
+        console.log(parser.format(signal));
+        console.log('─'.repeat(50) + '\n');
+
+        checkReset();
+        if (signal.action === 'OPEN') {
+          if (dailyTrades >= MAX_TRADES_PER_DAY) {
+            log(`⛔ الحد اليومي (${MAX_TRADES_PER_DAY}) - تم التخطي`);
+            continue;
+          }
+          const ok = await executeTradeREST(signal);
+          if (ok) {
+            dailyTrades++;
+            log(`📊 صفقات اليوم: ${dailyTrades}/${MAX_TRADES_PER_DAY}`);
+          }
+        } else if (signal.action === 'CLOSE') {
+          log(`🔴 أمر إغلاق ${signal.symbol}`);
+        }
+
+      } catch (err) {
+        log('❌ خطأ: ' + err.message);
+      }
+    }
+  });
+}
+
+// ── بدء التشغيل ───────────────────────────────
+log('🚀 بدء تشغيل البوت...');
+startWhatsApp().catch(err => {
+  log('❌ خطأ فادح: ' + err.message);
+  process.exit(1);
+});
