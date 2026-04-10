@@ -1,19 +1,21 @@
 {
   "name": "whatsapp-mt4-bot",
-  "version": "1.0.0",
-  "description": "WhatsApp to MT4 Auto Trading Bot",
+  "version": "2.0.0",
+  "description": "ربط واتساب بـ MT4 تلقائياً - Exness",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.0",
-    "axios": "^1.6.0",
-    "dotenv": "^16.3.1",
+    "@whiskeysockets/baileys": "^6.7.16",
+    "@hapi/boom": "^10.0.1",
+    "metaapi.cloud-sdk": "^29.0.0",
     "express": "^4.18.2",
-    "fs-extra": "^11.1.1",
-    "moment": "^2.29.4",
-    "pino": "^8.16.0",
-    "qrcode": "^1.5.3"
+    "qrcode": "^1.5.3",
+    "qrcode-terminal": "^0.12.0",
+    "pino": "^8.14.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
